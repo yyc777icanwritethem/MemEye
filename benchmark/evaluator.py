@@ -9,15 +9,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import nltk
 
-for _pkg in ("punkt", "punkt_tab"):
-    try:
-        nltk.data.find(f"tokenizers/{_pkg}")
-    except LookupError:
-        try:
-            nltk.download(_pkg, quiet=True)
-        except Exception:
-            pass
-
 from nltk.stem import PorterStemmer
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 

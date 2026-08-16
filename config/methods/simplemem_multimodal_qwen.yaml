@@ -1,0 +1,22 @@
+name: simplemem
+
+modality: multimodal
+
+llm_model: ""
+llm_api_key: ""
+llm_api_key_env: DASHSCOPE_API_KEY
+
+retrieve_k: 20
+
+embedding_model: all-MiniLM-L6-v2
+embedding_dim: 384
+
+caption_preprocessed: false
+
+temperature: 0.0
+max_tokens: 1000
+
+enable_self_evolution: false
+
+# Preserve and validate an existing exact-prefix snapshot after interruption.
+resume_existing: true

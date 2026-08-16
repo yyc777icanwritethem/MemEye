@@ -1,5 +1,6 @@
 import datetime as dt
 import inspect
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -345,8 +346,54 @@ def run_benchmark(
         prompt_path = Path(__file__).parent / "llm_judge.txt"
         _judge_template = prompt_path.read_text(encoding="utf-8")
 
-    qas = dataset.iter_qas(limit=max_questions)
+    requested_question_ids = [
+        str(value).strip()
+        for value in (cfg.get("eval", {}).get("question_ids", []) or [])
+        if str(value).strip()
+    ]
+    if requested_question_ids:
+        qa_by_id = {
+            str(qa.get("question_id", "")).strip(): qa for qa in dataset.qas
+        }
+        missing_question_ids = [
+            question_id for question_id in requested_question_ids
+            if question_id not in qa_by_id
+        ]
+        if missing_question_ids:
+            raise ValueError(
+                f"Unknown eval.question_ids: {missing_question_ids}"
+            )
+        qas = [qa_by_id[question_id] for question_id in requested_question_ids]
+    else:
+        qas = dataset.iter_qas(limit=max_questions)
+    resume_questions = bool(cfg.get("eval", {}).get("resume_questions", False))
+    checkpoint_path = (
+        paths["output_root"]
+        / "_question_checkpoints"
+        / str(cfg.get("task", {}).get("name", "task"))
+        / f"{_effective_method_name(method_cfg)}.jsonl"
+    )
+    completed_by_question: Dict[str, Dict[str, Any]] = {}
+    if resume_questions and checkpoint_path.is_file():
+        for line in checkpoint_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            question_id = str(row.get("question_id", "") or "")
+            if not question_id or question_id in completed_by_question:
+                raise ValueError(f"invalid duplicate question checkpoint: {question_id!r}")
+            completed_by_question[question_id] = row
     results: List[Dict[str, Any]] = []
+
+    # Memory-backed agentic methods may expose a preparation hook so complete
+    # scenario construction/reuse is timed separately from the first QA.
+    prepare = getattr(method, "prepare", None)
+    if is_agentic and callable(prepare):
+        prepare_started = dt.datetime.now()
+        prepare(dataset)
+        method.runtime_info["prepare_elapsed_ms"] = int(
+            (dt.datetime.now() - prepare_started).total_seconds() * 1000
+        )
 
     # Cache history for non-agentic methods whose build_history is
     # independent of the QA (e.g. full_context). Avoids rebuilding the
@@ -360,6 +407,10 @@ def run_benchmark(
     )
 
     for i, qa in enumerate(qas, start=1):
+        question_id = str(qa.get("question_id", "") or "")
+        if resume_questions and question_id in completed_by_question:
+            print(f"[INFO] QA {i}/{len(qas)} question_id={question_id} resume=skip")
+            continue
         question_text = qa.get("question", "")
         gt = qa.get("answer", "")
         has_options = isinstance(qa.get("options"), (dict, list)) and bool(qa.get("options"))
@@ -617,7 +668,19 @@ def run_benchmark(
 
         if current_method_runtime:
             result["method_runtime"] = current_method_runtime
-        results.append(result)
+        result["question_id"] = question_id
+        completed_by_question[question_id] = result
+        if resume_questions:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            with checkpoint_path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(result, ensure_ascii=False, default=str) + "\n")
+
+    if resume_questions:
+        expected_ids = [str(qa.get("question_id", "") or "") for qa in qas]
+        unexpected = set(completed_by_question) - set(expected_ids)
+        if unexpected:
+            raise ValueError(f"question checkpoint contains unexpected ids: {sorted(unexpected)}")
+        results = [completed_by_question[question_id] for question_id in expected_ids]
 
     method_runtime = dict(getattr(method, "runtime_info", {}) or {})
     payload = build_payload(cfg, paths, run_dir, dataset, results, method_runtime=method_runtime)

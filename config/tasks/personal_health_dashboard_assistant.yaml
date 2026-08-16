@@ -1,10 +1,11 @@
 name: personal_health_dashboard_assistant
 
 dataset:
-  dialog_json: data/dialog/Personal_Health_Dashboard_Assistant.json
+  dialog_json: data/dialog/Personal_Health_Dashboard_Assistant_Open.json
   image_root: data/image
 
 eval:
-  mode: mcq
+  mode: open
   output_json: output/results_personal_health_dashboard_assistant.json
   max_questions: 0
+  resume_questions: true

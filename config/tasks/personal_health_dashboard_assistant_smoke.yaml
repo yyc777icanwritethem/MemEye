@@ -1,0 +1,11 @@
+name: personal_health_dashboard_assistant_smoke
+
+dataset:
+  dialog_json: data/dialog/Personal_Health_Dashboard_Assistant_Open.json
+  image_root: data/image
+
+eval:
+  mode: open
+  output_json: output/results_personal_health_dashboard_assistant_smoke.json
+  max_questions: 0
+  question_ids: [Q63, Q10, Q58, Q47]

@@ -26,6 +26,7 @@ Design choices:
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -192,9 +193,14 @@ class SimpleMemMethod(HistoryMethod):
         self._speaker_a: str = "user"
         self._speaker_b: str = "assistant"
         self._debug_rows: List[Dict[str, Any]] = []
+        self._memory_debug_by_id: Dict[str, Dict[str, Any]] = {}
         self._top_k: int = max(1, int(self.config.get("retrieve_k", 20)))
+        self._fixed_top_k: bool = bool(self.config.get("fixed_top_k", False))
+        self._strict_top_k: bool = bool(self.config.get("strict_top_k", False))
         self._data_dir: Optional[Path] = None
         self._multimodal: bool = str(self.config.get("modality", "text_only")).strip().lower() == "multimodal"
+        self._resume_existing: bool = bool(self.config.get("resume_existing", False))
+        self._resumed_by_round: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -225,6 +231,10 @@ class SimpleMemMethod(HistoryMethod):
     def _debug_dir(self, dataset: MemoryBenchmarkDataset) -> Path:
         task_name = str(dataset.data.get("task_name", "")).strip() or dataset.dialog_json_path.stem
         safe_task = task_name.lower().replace(" ", "_").replace("/", "_")
+        runtime_paths = dict(self.config.get("_runtime_paths", {}))
+        output_root = str(runtime_paths.get("output_root", "")).strip()
+        if output_root:
+            return (Path(output_root) / "_simplemem_debug" / safe_task).resolve()
         return (REPO_ROOT / "output" / safe_task / "simplemem").resolve()
 
     def _runtime_data_dir(self, dataset: MemoryBenchmarkDataset) -> Path:
@@ -240,6 +250,230 @@ class SimpleMemMethod(HistoryMethod):
             "rows": self._debug_rows,
         }
         write_json(self._debug_dir(dataset) / "debug_trace.json", payload)
+
+    def _audit_ingestion(self, dataset: MemoryBenchmarkDataset) -> Dict[str, Any]:
+        """Validate the completed Omni snapshot before the first QA call."""
+        stored_rows = [r for r in self._debug_rows if r.get("type") == "stored_memory"]
+        error_rows = [
+            r for r in self._debug_rows
+            if r.get("type") in {"ingest_error", "ingest_rejected"}
+        ]
+        memory_ids = [str(r.get("memory_id", "") or "") for r in stored_rows]
+        missing_store_ids = [
+            memory_id for memory_id in memory_ids
+            if not memory_id or self._orchestrator.mau_store.get(memory_id) is None
+        ]
+        missing_image_pointers: List[str] = []
+        invalid_image_pointers: List[str] = []
+        if self._multimodal:
+            for row in stored_rows:
+                round_id = str(row.get("round_id", "") or "")
+                if not (dataset.rounds.get(round_id, {}).get("images", []) or []):
+                    continue
+                raw_pointer = str(row.get("raw_pointer", "") or "")
+                if not raw_pointer:
+                    missing_image_pointers.append(round_id)
+                elif not Path(raw_pointer).is_file():
+                    invalid_image_pointers.append(round_id)
+                stored_mau = self._orchestrator.mau_store.get(
+                    str(row.get("memory_id", "") or "")
+                )
+                if (
+                    stored_mau is None
+                    or str(getattr(stored_mau, "raw_pointer", "") or "") != raw_pointer
+                    or "vision_on_demand" not in stored_mau.metadata.tags
+                ):
+                    invalid_image_pointers.append(round_id)
+
+        vector_count = int(self._orchestrator.vector_store.count())
+        graph_checkpoint_ids = self._load_graph_checkpoint_ids()
+
+        audit = {
+            "type": "memory_audit",
+            "status": "passed",
+            "expected_rounds": len(dataset.rounds),
+            "stored_memories": len(stored_rows),
+            "unique_memory_ids": len(set(memory_ids)),
+            "ingest_failures": len(error_rows),
+            "missing_store_ids": missing_store_ids,
+            "missing_image_pointers": missing_image_pointers,
+            "invalid_image_pointers": invalid_image_pointers,
+            "vector_count": vector_count,
+            "graph_checkpoint_count": len(graph_checkpoint_ids),
+        }
+        if (
+            len(stored_rows) != len(dataset.rounds)
+            or len(set(memory_ids)) != len(memory_ids)
+            or error_rows
+            or missing_store_ids
+            or missing_image_pointers
+            or invalid_image_pointers
+            or vector_count != len(stored_rows)
+            or len(graph_checkpoint_ids) != len(stored_rows)
+        ):
+            audit["status"] = "failed"
+        self._debug_rows.append(audit)
+        self.runtime_info["memory_audit"] = audit
+        self._flush_debug(dataset)
+        if audit["status"] != "passed":
+            raise RuntimeError(f"SimpleMem memory audit failed: {audit}")
+        return audit
+
+    def _graph_checkpoint_path(self) -> Path:
+        if self._data_dir is None:
+            raise RuntimeError("SimpleMem data directory is not initialized")
+        return self._data_dir / "index" / "graph_processed.jsonl"
+
+    def _load_graph_checkpoint_ids(self) -> set[str]:
+        path = self._graph_checkpoint_path()
+        if not path.exists():
+            return set()
+        ids: set[str] = set()
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                memory_id = str(row.get("memory_id", "") or "")
+                if memory_id:
+                    ids.add(memory_id)
+        return ids
+
+    def _checkpoint_graph_result(
+        self,
+        memory_id: str,
+        *,
+        status: str,
+        error: str = "",
+        replayed: bool = False,
+    ) -> None:
+        self._orchestrator.knowledge_graph.save()
+        path = self._graph_checkpoint_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "memory_id": memory_id,
+                        "status": status,
+                        "error": error,
+                        "replayed": replayed,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    @staticmethod
+    def _mau_round_id(mau: Any) -> str:
+        tags = list(getattr(getattr(mau, "metadata", None), "tags", []) or [])
+        round_ids = [tag.split(":", 1)[1] for tag in tags if tag.startswith("round_id:")]
+        if len(round_ids) != 1:
+            raise ValueError(
+                f"Expected exactly one round_id tag for MAU {getattr(mau, 'id', '')}: {tags}"
+            )
+        return round_ids[0]
+
+    def _prepare_resume_state(self, dataset: MemoryBenchmarkDataset) -> None:
+        """Repair and validate a prefix snapshot without re-running completed writes."""
+        existing_maus = list(self._orchestrator.mau_store.iter_all())
+        if not existing_maus:
+            return
+        print(
+            f"[SimpleMem] Resume snapshot found: {len(existing_maus)} MAUs; "
+            "validating exact dataset prefix..."
+        )
+
+        by_round: Dict[str, Any] = {}
+        for mau in existing_maus:
+            round_id = self._mau_round_id(mau)
+            if round_id in by_round:
+                raise ValueError(f"Duplicate resumed round_id: {round_id}")
+            by_round[round_id] = mau
+
+        expected_order = [
+            str(dialogue.get("round", "")).strip()
+            for session_id in dataset.session_order()
+            for dialogue in dataset.get_session(session_id).get("dialogues", [])
+            if str(dialogue.get("round", "")).strip() in dataset.rounds
+        ]
+        existing_order = [self._mau_round_id(mau) for mau in existing_maus]
+        if existing_order != expected_order[: len(existing_order)]:
+            raise ValueError(
+                "Existing SimpleMem snapshot is not an exact dataset prefix; refusing unsafe resume"
+            )
+
+        # Persist the adapter's intended multimodal pointer/tag, including for
+        # snapshots created before the post-add_text update fix.
+        for round_id, mau in by_round.items():
+            images = list(dataset.rounds[round_id].get("images", []) or [])
+            changed = False
+            if self._multimodal and images and images[0]:
+                expected_pointer = str(images[0])
+                if mau.raw_pointer != expected_pointer:
+                    mau.raw_pointer = expected_pointer
+                    changed = True
+                if "vision_on_demand" not in mau.metadata.tags:
+                    mau.add_tag("vision_on_demand")
+                    changed = True
+            if changed:
+                self._orchestrator.mau_store.update(mau)
+
+        # A hard interruption can leave the append-only MAU store ahead of
+        # the periodically saved FAISS index. Rebuild only the derived index.
+        vector_items = [
+            (str(mau.id), list(mau.embedding))
+            for mau in existing_maus
+            if mau.embedding
+        ]
+        expected_vector_ids = [memory_id for memory_id, _ in vector_items]
+        current_vector_ids = list(
+            self._orchestrator.vector_store._text_store._id_mapping
+        )
+        if current_vector_ids != expected_vector_ids:
+            self._orchestrator.vector_store._text_store.rebuild_index(vector_items)
+            self._orchestrator.vector_store._visual_store.rebuild_index([])
+            self._orchestrator.save()
+        print(
+            f"[SimpleMem] Resume vector index repaired: {len(vector_items)} vectors."
+        )
+
+        # Knowledge-graph state is now isolated per scenario. Replay only MAUs
+        # missing a durable graph checkpoint; summaries/embeddings are reused.
+        processed = self._load_graph_checkpoint_ids()
+        replayed_count = 0
+        for mau in existing_maus:
+            memory_id = str(mau.id)
+            if memory_id in processed:
+                continue
+            try:
+                entities, relations = self._orchestrator.entity_extractor.extract(mau)
+                for entity in entities:
+                    self._orchestrator.knowledge_graph.add_extracted_entity(entity)
+                for relation in relations:
+                    self._orchestrator.knowledge_graph.add_extracted_relation(relation)
+                self._checkpoint_graph_result(
+                    memory_id, status="completed", replayed=True
+                )
+            except Exception as exc:
+                self._checkpoint_graph_result(
+                    memory_id,
+                    status="failed",
+                    error=str(exc),
+                    replayed=True,
+                )
+            processed.add(memory_id)
+            replayed_count += 1
+            if replayed_count % 5 == 0 or len(processed) == len(existing_maus):
+                print(
+                    f"[SimpleMem] Resume graph checkpoints: "
+                    f"{len(processed)}/{len(existing_maus)}"
+                )
+
+        self._resumed_by_round = by_round
+        print(
+            f"[SimpleMem] Resume ready: reusing {len(by_round)} completed rounds."
+        )
 
     def _build_orchestrator(self, dataset: MemoryBenchmarkDataset) -> None:
         OmniMemoryConfig, OmniMemoryOrchestrator = _load_simplemem_classes()
@@ -276,13 +510,14 @@ class SimpleMemMethod(HistoryMethod):
 
         # Retrieval depth
         cfg.retrieval.default_top_k = self._top_k
+        cfg.retrieval.benchmark_fixed_top_k = self._top_k if self._fixed_top_k else None
 
         # Skip self-evolution (auto-research loop) by default for benchmark fairness
         cfg.enable_self_evolution = bool(self.config.get("enable_self_evolution", False))
 
         # Per-task data dir; cleared between runs to avoid stale state
         data_dir = self._runtime_data_dir(dataset)
-        if data_dir.exists():
+        if data_dir.exists() and not self._resume_existing:
             import shutil
 
             shutil.rmtree(data_dir, ignore_errors=True)
@@ -292,6 +527,30 @@ class SimpleMemMethod(HistoryMethod):
         self._orchestrator = OmniMemoryOrchestrator(
             config=cfg, data_dir=str(data_dir)
         )
+        answer_base_url = str(self.config.get("answer_base_url", "")).strip()
+        answer_model = str(self.config.get("answer_model", "")).strip()
+        if answer_base_url or answer_model:
+            from openai import OpenAI
+
+            answer_key_env = str(
+                self.config.get("answer_api_key_env", "LOCAL_QWEN_API_KEY")
+            ).strip()
+            answer_api_key = os.getenv(answer_key_env, "")
+            if not answer_api_key:
+                raise ValueError(
+                    f"Answer API key environment variable is empty: {answer_key_env}"
+                )
+            self._orchestrator._benchmark_answer_client = OpenAI(
+                api_key=answer_api_key,
+                base_url=answer_base_url or base_url,
+                timeout=float(self.config.get("answer_timeout", 300)),
+            )
+            self._orchestrator._benchmark_answer_model = answer_model or model_name
+            self.runtime_info["retrieval_model"] = model_name
+            self.runtime_info["answer_model"] = answer_model or model_name
+            self.runtime_info["answer_base_url"] = answer_base_url or base_url or ""
+        if self._resume_existing:
+            self._prepare_resume_state(dataset)
 
         # Caption-only mode: disable modality keyword detection so that words
         # like "image"/"shown"/"visual" in queries don't trigger a VISUAL-only
@@ -323,6 +582,35 @@ class SimpleMemMethod(HistoryMethod):
                     timestamp=timestamp,
                     raw_dialogue=raw_dialogue,
                 )
+                resumed_mau = self._resumed_by_round.get(round_id)
+                if resumed_mau is not None:
+                    memory_id = str(resumed_mau.id)
+                    mau_tags = list(resumed_mau.metadata.tags or [])
+                    self._memory_debug_by_id[memory_id] = {
+                        "memory_id": memory_id,
+                        "round_id": round_id,
+                        "session_id": round_payload.get("session_id", ""),
+                        "raw_pointer": str(resumed_mau.raw_pointer or ""),
+                        "mau_tags": mau_tags,
+                    }
+                    self._debug_rows.append(
+                        {
+                            "type": "stored_memory",
+                            "round_id": round_id,
+                            "session_id": round_payload.get("session_id", ""),
+                            "timestamp": timestamp or "",
+                            "tags": tags,
+                            "mau_tags": mau_tags,
+                            "text": text,
+                            "memory_id": memory_id,
+                            "raw_pointer": str(resumed_mau.raw_pointer or ""),
+                            "elapsed_ms": 0.0,
+                            "reason": "",
+                            "resumed": True,
+                        }
+                    )
+                    continue
+                started_at = time.perf_counter()
                 try:
                     result = self._orchestrator.add_text(text, tags=tags or None, force=True)
                 except Exception as exc:
@@ -331,6 +619,7 @@ class SimpleMemMethod(HistoryMethod):
                             "type": "ingest_error",
                             "round_id": round_id,
                             "error": str(exc),
+                            "elapsed_ms": (time.perf_counter() - started_at) * 1000.0,
                         }
                     )
                     continue
@@ -342,6 +631,25 @@ class SimpleMemMethod(HistoryMethod):
                     if round_images and round_images[0]:
                         result.mau.raw_pointer = str(round_images[0])
                         result.mau.add_tag("vision_on_demand")
+                        self._orchestrator.mau_store.update(result.mau)
+                if stored:
+                    self._orchestrator.save()
+                    self._checkpoint_graph_result(
+                        str(result.mau.id), status="completed", replayed=False
+                    )
+                if stored:
+                    memory_id = str(getattr(result.mau, "id", "") or "")
+                    metadata = getattr(result.mau, "metadata", None)
+                    mau_tags = list(getattr(metadata, "tags", []) or [])
+                    self._memory_debug_by_id[memory_id] = {
+                        "memory_id": memory_id,
+                        "round_id": round_id,
+                        "session_id": round_payload.get("session_id", ""),
+                        "raw_pointer": str(
+                            getattr(result.mau, "raw_pointer", "") or ""
+                        ),
+                        "mau_tags": mau_tags,
+                    }
                 self._debug_rows.append(
                     {
                         "type": "stored_memory" if stored else "ingest_rejected",
@@ -350,9 +658,26 @@ class SimpleMemMethod(HistoryMethod):
                         "timestamp": timestamp or "",
                         "tags": tags,
                         "text": text,
+                        "memory_id": (
+                            str(getattr(result.mau, "id", "") or "") if stored else ""
+                        ),
+                        "raw_pointer": (
+                            str(getattr(result.mau, "raw_pointer", "") or "")
+                            if stored else ""
+                        ),
+                        "mau_tags": (
+                            list(getattr(getattr(result.mau, "metadata", None), "tags", []) or [])
+                            if stored else []
+                        ),
+                        "elapsed_ms": (time.perf_counter() - started_at) * 1000.0,
                         "reason": getattr(getattr(result, "trigger_result", None), "reason", "") if not stored else "",
                     }
                 )
+                if stored:
+                    print(
+                        f"[SimpleMem] Ingested round {round_id}; "
+                        f"new_memory_id={result.mau.id}"
+                    )
 
     def _ensure_initialized(self, dataset: MemoryBenchmarkDataset) -> None:
         dataset_id = id(dataset)
@@ -361,6 +686,8 @@ class SimpleMemMethod(HistoryMethod):
 
         self._ensure_caption_preprocessed(dataset)
         self._debug_rows = []
+        self._memory_debug_by_id = {}
+        self._resumed_by_round = {}
         self._build_orchestrator(dataset)
         mode_label = "multimodal" if self._multimodal else "text-only"
         print(
@@ -375,11 +702,19 @@ class SimpleMemMethod(HistoryMethod):
         if self._data_dir is not None:
             self.runtime_info["data_dir"] = str(self._data_dir)
         print(f"[SimpleMem] Memory ready: {ingested} rounds ingested.")
-        self._flush_debug(dataset)
+        audit = self._audit_ingestion(dataset)
+        print(
+            f"[SimpleMem] Memory audit passed: "
+            f"{audit['stored_memories']}/{audit['expected_rounds']} rounds."
+        )
 
     # ------------------------------------------------------------------
     # HistoryMethod overrides
     # ------------------------------------------------------------------
+
+    def prepare(self, dataset: MemoryBenchmarkDataset) -> None:
+        """Prepare/reuse the complete memory before per-question timing starts."""
+        self._ensure_initialized(dataset)
 
     def answer(
         self,
@@ -392,6 +727,7 @@ class SimpleMemMethod(HistoryMethod):
         assert self._orchestrator is not None
 
         query = _question_with_image_caption(qa, question)
+        started_at = time.perf_counter()
         try:
             result = self._orchestrator.answer(
                 query,
@@ -407,6 +743,7 @@ class SimpleMemMethod(HistoryMethod):
                     "recall_query": query,
                     "question_images": list(question_images or []),
                     "error": str(exc),
+                    "elapsed_ms": (time.perf_counter() - started_at) * 1000.0,
                 }
             )
             self._flush_debug(dataset)
@@ -415,9 +752,33 @@ class SimpleMemMethod(HistoryMethod):
         if isinstance(result, dict):
             answer_text = str(result.get("answer", "") or "").strip()
             sources = result.get("sources") or []
+            retrieval_result = result.get("retrieval_result")
         else:
             answer_text = str(result or "").strip()
             sources = []
+            retrieval_result = None
+
+        retrieved_memory_metadata: List[Dict[str, Any]] = []
+        if isinstance(retrieval_result, dict):
+            for item in retrieval_result.get("items", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                memory_id = str(item.get("id", "") or "")
+                metadata = dict(self._memory_debug_by_id.get(memory_id, {}))
+                metadata["memory_id"] = memory_id
+                metadata["score"] = item.get("score")
+                retrieved_memory_metadata.append(metadata)
+
+        retrieved_round_ids = list(dict.fromkeys(
+            str(item.get("round_id", "") or "")
+            for item in retrieved_memory_metadata
+            if str(item.get("round_id", "") or "")
+        ))
+        if self._strict_top_k and len(retrieved_round_ids) != self._top_k:
+            raise RuntimeError(
+                f"controlled TopK mismatch: requested {self._top_k} unique rounds, "
+                f"received {len(retrieved_round_ids)}"
+            )
 
         self._debug_rows.append(
             {
@@ -427,7 +788,29 @@ class SimpleMemMethod(HistoryMethod):
                 "recall_query": query,
                 "question_images": list(question_images or []),
                 "num_sources": len(sources) if isinstance(sources, list) else 0,
+                "sources": sources if isinstance(sources, list) else [],
+                "retrieval_result": retrieval_result,
+                "retrieved_memory_metadata": retrieved_memory_metadata,
+                "top_k_control": {
+                    "requested_unique_rounds": self._top_k,
+                    "fixed": self._fixed_top_k,
+                    "strict": self._strict_top_k,
+                    "actual_memory_items": len(retrieved_memory_metadata),
+                    "actual_unique_rounds": len(retrieved_round_ids),
+                    "round_ids": retrieved_round_ids,
+                },
                 "prediction": answer_text,
+                "retrieval_model": _resolve_model_name(
+                    self.config, dict(self.config.get("_model_cfg", {}))
+                ),
+                "answer_model": str(
+                    getattr(
+                        self._orchestrator,
+                        "_benchmark_answer_model",
+                        self._orchestrator.config.llm.query_model,
+                    )
+                ),
+                "elapsed_ms": (time.perf_counter() - started_at) * 1000.0,
             }
         )
         self._flush_debug(dataset)

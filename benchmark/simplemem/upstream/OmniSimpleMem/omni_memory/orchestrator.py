@@ -157,7 +157,9 @@ class OmniMemoryOrchestrator:
         )
 
         # Initialize knowledge graph + graph retriever
-        self.knowledge_graph = KnowledgeGraph()
+        self.knowledge_graph = KnowledgeGraph(
+            storage_path=str(Path(self.config.storage.index_dir) / "knowledge_graph")
+        )
         self.entity_extractor = EntityExtractor(self.config)
         # Pass an actual EntityExtractor into GraphRetriever (previously passed vector_store by mistake)
         self.graph_retriever = GraphRetriever(
@@ -752,6 +754,12 @@ class OmniMemoryOrchestrator:
         # Process query
         parsed = self.query_processor.process(query)
         strategy = self.query_processor.determine_retrieval_strategy(parsed)
+        fixed_top_k = getattr(self.config.retrieval, "benchmark_fixed_top_k", None)
+        effective_top_k = (
+            int(fixed_top_k)
+            if fixed_top_k is not None
+            else strategy.get("top_k", top_k)
+        )
 
         # Get preview
         use_time = time_range if time_range is not None else strategy.get("time_filter")
@@ -767,7 +775,7 @@ class OmniMemoryOrchestrator:
         else:
             result = self.retriever.retrieve_preview(
                 parsed.cleaned_query,
-                top_k=strategy.get("top_k", top_k),
+                top_k=effective_top_k,
                 modality_filter=strategy.get("modality_filter"),
                 time_range=use_time,
                 tags_filter=use_tags,
@@ -779,7 +787,7 @@ class OmniMemoryOrchestrator:
         # IMPORTANT: Do NOT re-sort — FAISS semantic ordering must be preserved.
         # BM25 results are appended at the end as supplementary context.
         if self.bm25_store.is_available:
-            bm25_top_k = max(10, strategy.get("top_k", top_k) // 2)
+            bm25_top_k = max(10, effective_top_k // 2)
             bm25_results = self.bm25_store.search(
                 parsed.cleaned_query,
                 top_k=bm25_top_k,
@@ -804,6 +812,12 @@ class OmniMemoryOrchestrator:
                             }
                         )
                         existing_ids.add(mau_id)
+
+        # Hybrid BM25 supplements may grow the result beyond the requested
+        # depth.  Only controlled benchmark runs trim this union; native Omni
+        # runs retain their original behavior when benchmark_fixed_top_k=None.
+        if fixed_top_k is not None:
+            result.items = result.items[:effective_top_k]
 
         parametric_result = self.parametric_store.recall(query, top_k=3)
         if parametric_result and parametric_result.confidence > 0.8:
@@ -965,7 +979,12 @@ class OmniMemoryOrchestrator:
                 expanded_by_id = {e["id"]: e for e in expansion.items}
                 for i, item in enumerate(retrieval.items):
                     if item["id"] in expanded_by_id:
-                        retrieval.items[i] = expanded_by_id[item["id"]]
+                        # Preserve retrieval provenance (score/tags/has_raw_data)
+                        # while adding the expanded raw content.
+                        retrieval.items[i] = {
+                            **item,
+                            **expanded_by_id[item["id"]],
+                        }
 
         # Format context
         context = self.retriever.format_for_llm(retrieval, include_instructions=False)
@@ -998,14 +1017,20 @@ class OmniMemoryOrchestrator:
             user_content = content_parts
 
         # Generate answer
-        client = self._get_llm_client()
+        # Benchmark adapters may freeze a separate final answerer while leaving
+        # all native SimpleMem query planning/entity extraction on the unified
+        # model.  With no override, upstream behavior is unchanged.
+        client = getattr(self, "_benchmark_answer_client", None) or self._get_llm_client()
+        answer_model = getattr(
+            self, "_benchmark_answer_model", self.config.llm.query_model
+        )
         try:
             system_content = (
                 "You are a professional Q&A assistant. Your task is to extract concise, "
                 "accurate answers from the provided memory context. "
                 "You should make reasonable inferences from the context when possible. "
-                "IMPORTANT: The conversations took place in 2023. Never use today's date "
-                "(2025 or 2026) as an answer. Only use dates that actually appear in the memories. "
+                "Do not assume a calendar year or use today's date. Only use dates that "
+                "actually appear in the provided memories. "
                 "You must output valid JSON format."
             )
             answer_instructions = (
@@ -1019,9 +1044,9 @@ class OmniMemoryOrchestrator:
                 "3. Answer based on the provided context. You may make reasonable inferences "
                 "from the information given (e.g., inferring personality traits, likely preferences, "
                 "or approximate dates from surrounding context)\n"
-                "4. All dates in the response must be formatted as 'DD Month YYYY'. "
-                "NEVER use dates from 2025 or 2026. Use the 'Time:' metadata shown with each memory "
-                "to determine when events occurred.\n"
+                "4. If the question asks for a date, preserve the date supported by the "
+                "memories and use the 'Time:' metadata when relevant. Do not substitute the "
+                "current date.\n"
                 "5. Try your best to answer. Only respond with 'unknown' if the context contains "
                 "absolutely NO relevant information about the topic asked\n"
                 "6. For counting questions, answer with just the number (e.g., '2' not 'twice')\n"
@@ -1042,7 +1067,7 @@ class OmniMemoryOrchestrator:
 
             # Force JSON output for reliable extraction of concise answers
             api_kwargs = dict(
-                model=self.config.llm.query_model,
+                model=answer_model,
                 messages=[
                     {"role": "system", "content": system_content},
                     {"role": "user", "content": final_user_content},

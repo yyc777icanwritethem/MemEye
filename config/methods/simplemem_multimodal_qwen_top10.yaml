@@ -1,0 +1,15 @@
+name: simplemem
+modality: multimodal
+llm_model: ""
+llm_api_key: ""
+llm_api_key_env: DASHSCOPE_API_KEY
+retrieve_k: 10
+fixed_top_k: true
+strict_top_k: true
+embedding_model: all-MiniLM-L6-v2
+embedding_dim: 384
+caption_preprocessed: false
+temperature: 0.0
+max_tokens: 1000
+enable_self_evolution: false
+resume_existing: true

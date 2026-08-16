@@ -1,0 +1,11 @@
+name: home_renovation_interior_design_smoke
+
+dataset:
+  dialog_json: data/dialog/Home_Renovation_Interior_Design_Open.json
+  image_root: data/image
+
+eval:
+  mode: open
+  output_json: output/results_home_renovation_interior_design_smoke.json
+  max_questions: 0
+  question_ids: [Q65, Q12, Q2, Q64]

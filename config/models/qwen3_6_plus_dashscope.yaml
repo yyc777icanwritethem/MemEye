@@ -1,0 +1,7 @@
+name: qwen3_6_plus_dashscope
+provider: openai_api
+model: qwen3.6-plus-2026-04-02
+api_key_env: DASHSCOPE_API_KEY
+base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+max_new_tokens: 1000
+timeout: 180
