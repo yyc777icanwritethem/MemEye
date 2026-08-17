@@ -206,6 +206,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "source_predictions": str(predictions_path),
         "source_predictions_sha256": _sha256(predictions_path),
         "answer_model": args.model,
+        "enable_thinking": False,
         "expected_top_k": args.expected_top_k,
         "retrieval_invoked": False,
         "question_order": [str(row["question_id"]) for row in predictions],
@@ -252,6 +253,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     "model": args.model,
                     "messages": messages,
                     "temperature": 0.1,
+                    "extra_body": {"enable_thinking": False},
                 }
                 if not multimodal:
                     kwargs["response_format"] = {"type": "json_object"}
@@ -268,10 +270,34 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     flush=True,
                 )
                 if attempt == args.max_retries:
-                    raise
+                    if not args.continue_on_error:
+                        raise
+                    raw = None
+                    usage = {}
+                    break
                 time.sleep(min(30.0, 2.0 ** attempt))
         else:  # pragma: no cover
             raise RuntimeError(str(last_error))
+        if raw is None:
+            failure = {
+                "question_id": question_id,
+                "index": index,
+                "error_type": type(last_error).__name__ if last_error else "unknown",
+                "error": str(last_error or "unknown error"),
+                "attempts": args.max_retries,
+                "recorded_at": datetime.now().astimezone().isoformat(),
+            }
+            with (output_dir / "answer_failures.jsonl").open(
+                "a", encoding="utf-8", newline="\n"
+            ) as handle:
+                handle.write(json.dumps(failure, ensure_ascii=False) + "\n")
+            print(
+                f"[frozen-answer] {index}/{len(predictions)} {question_id} "
+                "status=deferred continuing_after_error",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
         answer = extract_answer(raw)
         exact, contains = score_open(answer, str(source.get("gt", "")))
         result = dict(source)
@@ -314,21 +340,40 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             flush=True,
         )
 
-    ordered = [completed[str(row["question_id"])] for row in predictions]
+    missing_question_ids = [
+        str(row["question_id"])
+        for row in predictions
+        if str(row["question_id"]) not in completed
+    ]
+    ordered = [
+        completed[str(row["question_id"])]
+        for row in predictions
+        if str(row["question_id"]) in completed
+    ]
     predictions_out = output_dir / "predictions.jsonl"
     predictions_out.write_text(
         "".join(json.dumps(row, ensure_ascii=False, default=str) + "\n" for row in ordered),
         encoding="utf-8",
     )
     summary = summarize_results(ordered)
-    summary.update({"status": "completed", "count": len(ordered)})
+    final_status = "completed" if not missing_question_ids else "incomplete"
+    summary.update(
+        {
+            "status": final_status,
+            "count": len(ordered),
+            "expected_count": len(predictions),
+            "missing_question_ids": missing_question_ids,
+        }
+    )
     _write_json(output_dir / "summary.json", summary)
     manifest.update(
         {
-            "status": "completed",
+            "status": final_status,
             "predictions": str(predictions_out),
             "predictions_sha256": _sha256(predictions_out),
             "count": len(ordered),
+            "expected_count": len(predictions),
+            "missing_question_ids": missing_question_ids,
         }
     )
     _write_json(manifest_path, manifest)
@@ -347,6 +392,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--max-questions", type=int)
+    parser.add_argument("--continue-on-error", action="store_true")
     return parser.parse_args()
 
 

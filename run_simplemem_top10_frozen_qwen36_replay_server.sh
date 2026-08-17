@@ -16,7 +16,7 @@ run_home() {
     --debug-trace "$SOURCE/_simplemem_debug/home_renovation_interior_design/debug_trace.json" \
     --source-predictions "$SOURCE/home_renovation_interior_design/20260816_225711_qwen3_6_plus_dashscope_simplemem__multimodal/predictions.jsonl" \
     --output-dir "$OUTPUT/home_renovation_interior_design" \
-    --timeout 180 --max-retries 3
+    --timeout 180 --max-retries 3 --continue-on-error
 }
 
 run_health() {
@@ -24,7 +24,7 @@ run_health() {
     --debug-trace "$SOURCE/_simplemem_debug/personal_health_dashboard_assistant/debug_trace.json" \
     --source-predictions "$SOURCE/personal_health_dashboard_assistant/20260816_225711_qwen3_6_plus_dashscope_simplemem__multimodal/predictions.jsonl" \
     --output-dir "$OUTPUT/personal_health_dashboard_assistant" \
-    --timeout 180 --max-retries 3
+    --timeout 180 --max-retries 3 --continue-on-error
 }
 
 echo "stage=frozen_qwen36_top10 status=started at=$(date -Iseconds)"
