@@ -16,6 +16,7 @@ import json
 import mimetypes
 import os
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -226,7 +227,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     api_key = os.environ.get(args.api_key_env, "").strip()
     if not api_key:
         raise ValueError(f"empty API key environment variable: {args.api_key_env}")
-    client = OpenAI(api_key=api_key, base_url=args.base_url, timeout=args.timeout)
+    # Keep retry ownership in this runner.  The OpenAI SDK otherwise performs
+    # its own retries inside every outer attempt, which can leave one large
+    # multimodal request apparently stuck for close to an hour.
+    client = OpenAI(
+        api_key=api_key,
+        base_url=args.base_url,
+        timeout=args.timeout,
+        max_retries=0,
+    )
 
     for index, source in enumerate(predictions, 1):
         question_id = str(source["question_id"])
@@ -252,6 +261,12 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 break
             except Exception as exc:
                 last_error = exc
+                print(
+                    f"[frozen-answer] {index}/{len(predictions)} {question_id} "
+                    f"attempt={attempt}/{args.max_retries} error={type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 if attempt == args.max_retries:
                     raise
                 time.sleep(min(30.0, 2.0 ** attempt))

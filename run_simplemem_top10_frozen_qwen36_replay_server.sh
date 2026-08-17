@@ -15,14 +15,16 @@ run_home() {
   "$PYTHON" -u "$ROOT/replay_simplemem_frozen_answers.py" \
     --debug-trace "$SOURCE/_simplemem_debug/home_renovation_interior_design/debug_trace.json" \
     --source-predictions "$SOURCE/home_renovation_interior_design/20260816_225711_qwen3_6_plus_dashscope_simplemem__multimodal/predictions.jsonl" \
-    --output-dir "$OUTPUT/home_renovation_interior_design"
+    --output-dir "$OUTPUT/home_renovation_interior_design" \
+    --timeout 180 --max-retries 3
 }
 
 run_health() {
   "$PYTHON" -u "$ROOT/replay_simplemem_frozen_answers.py" \
     --debug-trace "$SOURCE/_simplemem_debug/personal_health_dashboard_assistant/debug_trace.json" \
     --source-predictions "$SOURCE/personal_health_dashboard_assistant/20260816_225711_qwen3_6_plus_dashscope_simplemem__multimodal/predictions.jsonl" \
-    --output-dir "$OUTPUT/personal_health_dashboard_assistant"
+    --output-dir "$OUTPUT/personal_health_dashboard_assistant" \
+    --timeout 180 --max-retries 3
 }
 
 echo "stage=frozen_qwen36_top10 status=started at=$(date -Iseconds)"
